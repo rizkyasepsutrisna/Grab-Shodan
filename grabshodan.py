@@ -3,7 +3,8 @@
 """
 Shodan .env MAIL_USERNAME Hunter
 - Rotasi API key dari api.txt saat error/rate limit (lanjut page yang sama)
-- Stop jika semua API key sudah dicoba & gagal
+- Deep idle setiap 10 page
+- Jika semua API key error, deep idle 10 menit lalu lanjut lagi (tanpa exit)
 - Dedup (in-memory + load dari output jika ada)
 - Resume-friendly
 - Progress bar & banner
@@ -20,16 +21,21 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 # ======= KONFIGURASI =======
-QUERY = 'country:"US" port:80'   # ubah sesuai kebutuhan
-API_LIST_FILE = "api.txt"                                      # satu API key per baris
+QUERY = 'asn:"as16509" http.status:200 port:80'   # ubah sesuai kebutuhan
+API_LIST_FILE = "api.txt"                          # satu API key per baris
 OUTPUT_FILE = f"shodan_resukts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 
 # Jeda request (pelan-pelan)
 BASE_DELAY = 1.8
 JITTER = 1.4
-LONG_PAUSE_EVERY = 5
-LONG_BASE = 8.0
-LONG_JITTER = 6.0
+
+# Deep idle per X halaman
+DEEP_IDLE_EVERY_PAGES = 10               # <- sesuai permintaan: setiap 10 page
+DEEP_IDLE_BASE = 8.0
+DEEP_IDLE_JITTER = 6.0
+
+# Cooldown global ketika SEMUA API key error
+GLOBAL_DEEP_IDLE_SECONDS = 600           # 10 menit
 
 # Retry/backoff per key sebelum ganti key
 MAX_RETRIES_PER_KEY = 2
@@ -94,7 +100,7 @@ def polite_sleep_short():
 # ======= CORE =======
 def run():
     banner()
-    type_effect("=== SHODAN .ENV MAIL_USERNAME HUNTER (Auto-rotate API) ===\n", 0.008)
+    type_effect("=== SHODAN .ENV MAIL_USERNAME HUNTER (Auto-rotate API + Deep Idle) ===\n", 0.008)
 
     api_keys = load_api_keys(API_LIST_FILE)
     key_idx = 0
@@ -116,7 +122,7 @@ def run():
     total_new = 0
 
     while True:
-        # Set ini melacak berapa banyak API key yang sudah dicoba untuk PAGE saat ini
+        # Melacak berapa banyak API key yang sudah dicoba untuk PAGE saat ini
         tried_keys_this_page = set()
         retries = 0
 
@@ -141,11 +147,17 @@ def run():
                 # tandai key sekarang sudah dicoba untuk page ini
                 tried_keys_this_page.add(api_keys[key_idx])
 
-                # jika semua key sudah dicoba & gagal → stop total
+                # Jika SEMUA key sudah dicoba & gagal → deep idle 10 menit lalu reset percobaan key pada page ini
                 if len(tried_keys_this_page) >= len(api_keys):
-                    type_effect("[ERROR] Semua API key di api.txt sudah dicoba dan gagal. Menghentikan script.\n", 0.004, Fore.RED)
-                    f_out.close()
-                    sys.exit(1)
+                    type_effect(f"[GLOBAL-COOLDOWN] Semua API key error pada Page {page}. Deep idle {GLOBAL_DEEP_IDLE_SECONDS//60} menit...\n", 0.004, Fore.MAGENTA)
+                    progress_bar(label="deep idle (global)", seconds=GLOBAL_DEEP_IDLE_SECONDS, width=40, color=Fore.CYAN)
+                    # reset siklus key & percobaan untuk page ini
+                    tried_keys_this_page = set()
+                    retries = 0
+                    # mulai lagi dari key saat ini atau putar ke key berikutnya agar distribusi merata
+                    key_idx = (key_idx + 1) % len(api_keys)
+                    api = shodan.Shodan(api_keys[key_idx])
+                    continue
 
                 # ganti key & ulangi request page yang sama
                 type_effect(f"[SWITCH] Ganti API key karena error: {e}\n", 0.003, Fore.MAGENTA)
@@ -184,10 +196,14 @@ def run():
         # next page
         page += 1
 
-        # jeda antar page
-        polite_sleep_short()
-        if (page - 1) % LONG_PAUSE_EVERY == 0:
-            progress_bar(label="deep idle", seconds=LONG_BASE + random.uniform(0, LONG_JITTER), width=26, color=Fore.CYAN)
+        # deep idle tiap 10 page
+        if (page - 1) % DEEP_IDLE_EVERY_PAGES == 0:
+            seconds = DEEP_IDLE_BASE + random.uniform(0, DEEP_IDLE_JITTER)
+            type_effect(f"[IDLE] Deep idle setiap {DEEP_IDLE_EVERY_PAGES} page: {seconds:.1f}s\n", 0.003, Fore.CYAN)
+            progress_bar(label="deep idle", seconds=seconds, width=26, color=Fore.CYAN)
+        else:
+            # jeda antar page biasa
+            polite_sleep_short()
 
     f_out.close()
     type_effect(f"\n[SELESAI] Total IP baru ditambahkan: {total_new}\n", 0.008, Fore.CYAN)
